@@ -70,6 +70,20 @@ Folia introduces new APIs to help plugins work correctly within its threading mo
 
 Folia also plans to add more thread-check APIs to help developers ensure their code is running in the appropriate context and to make incorrect accesses fail hard, aiding in debugging. Proper asynchronous event handling is also a planned API addition.
 
+## Performance and Scalability
+
+Folia's core architectural change, regionised multithreading, is specifically designed to enhance server performance and scalability under certain conditions. The primary goal is to leverage multi-core processors more effectively.
+
+-   **Target Conditions:** Folia is expected to perform best on servers with a high number of CPU cores (the documentation recommends at least 16 cores, not just threads) and a player base that is naturally spread out across the game world (e.g., Skyblock, Survival Multiplayer). This allows Folia to create multiple independent regions that can genuinely run their tick loops in parallel.
+
+-   **Regional TPS:** Each independent region in Folia runs its own tick loop and aims to maintain the standard Minecraft tick rate of 20 TPS. As long as the server's thread pool is not maximally utilized, the scheduling algorithm is designed to ensure that regions taking 50ms or less per tick will achieve this target.
+
+-   **Scalability Approach:** By distributing the game logic processing across multiple threads, Folia theoretically allows the server to support more players or more demanding game worlds without the single-thread bottleneck that can limit traditional Minecraft server software. The more independent regions that can be processed in parallel, the better the server should scale.
+
+-   **Benchmark Data & Anecdotal Evidence:** The official documentation does not provide specific quantitative benchmarks comparing Folia to PaperMC or vanilla Minecraft. However, it does mention that configuration advice was derived from experiences on a test server that peaked at around 330 players. While not a formal benchmark, this indicates the scale of player counts Folia is intended to handle. The focus is on the architectural capacity for scaling rather than on specific performance figures at this stage.
+
+It is crucial to configure Folia appropriately, considering thread allocation for regions, I/O, and other tasks, to achieve optimal performance on a given hardware setup.
+
 ## Conclusion
 
 Folia represents a significant step towards highly scalable Minecraft servers. By fundamentally redesigning the server's core processing around regionised multithreading, it aims to deliver substantial performance improvements for specific server types, particularly those with large, spread-out player bases and powerful multi-core hardware. While this necessitates considerable adaptation from plugin developers, Folia's innovative approach holds the promise of pushing the boundaries of Minecraft server performance.
