@@ -1,0 +1,582 @@
+--- a/net/minecraft/commands/Commands.java
++++ b/net/minecraft/commands/Commands.java
+@@ -257,7 +257,7 @@
+         CloneCommands.register(this.dispatcher, this.context);
+         DebugCommands.register(this.dispatcher);
+         //DataCommands.register(this.dispatcher); // Folia - region threading - TODO later
+-        // TODO: DatapackCommand
++        DataCommands.register(this.dispatcher); // Folia - region threading - TODO later
+         DefaultGameModeCommands.register(this.dispatcher);
+         DifficultyCommand.register(this.dispatcher);
+         EffectCommands.register(this.dispatcher);
+--- a/net/minecraft/commands/DataCommands.java
++++ b/net/minecraft/commands/DataCommands.java
+@@ -0,0 +1,648 @@
++package net.minecraft.commands;
++
++import com.google.common.collect.ImmutableList;
++import com.google.common.collect.Lists;
++import com.mojang.brigadier.CommandDispatcher;
++import com.mojang.brigadier.arguments.DoubleArgumentType;
++import com.mojang.brigadier.arguments.IntegerArgumentType;
++import com.mojang.brigadier.builder.ArgumentBuilder;
++import com.mojang.brigadier.builder.LiteralArgumentBuilder;
++import com.mojang.brigadier.context.CommandContext;
++import com.mojang.brigadier.exceptions.CommandSyntaxException;
++import com.mojang.brigadier.exceptions.Dynamic2CommandExceptionType;
++import com.mojang.brigadier.exceptions.Dynamic3CommandExceptionType;
++import com.mojang.brigadier.exceptions.DynamicCommandExceptionType;
++import com.mojang.brigadier.exceptions.SimpleCommandExceptionType;
++import java.util.Collections;
++import java.util.List;
++import java.util.UUID;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.CompletionException;
++import java.util.function.Function;
++import java.util.function.Supplier;
++import java.util.stream.Collectors;
++import net.minecraft.commands.arguments.CompoundTagArgument;
++import net.minecraft.commands.arguments.NbtPathArgument;
++import net.minecraft.commands.arguments.NbtTagArgument;
++import net.minecraft.commands.arguments.ResourceLocationArgument;
++import net.minecraft.commands.arguments.blocks.BlockPosArgument;
++import net.minecraft.commands.arguments.selector.EntityArgument;
++import net.minecraft.core.BlockPos;
++import net.minecraft.core.HolderLookup;
++import net.minecraft.nbt.CollectionTag;
++import net.minecraft.nbt.CompoundTag;
++import net.minecraft.nbt.NumericTag;
++import net.minecraft.nbt.StringTag;
++import net.minecraft.nbt.Tag;
++import net.minecraft.network.chat.Component;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.util.Mth;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.level.block.entity.BlockEntity;
++import net.minecraft.world.level.block.state.BlockState;
++import org.bukkit.plugin.Plugin;
++import io.papermc.paper.util.Pair;
++
++public class DataCommands {
++
++    static final SimpleCommandExceptionType ERROR_MERGE_UNCHANGED = new SimpleCommandExceptionType(Component.translatable("commands.data.merge.failed"));
++    static final DynamicCommandExceptionType ERROR_GET_NOT_FOUND = new DynamicCommandExceptionType(path -> Component.translatable("commands.data.get.unknown", path));
++    static final DynamicCommandExceptionType ERROR_GET_INVALID = new DynamicCommandExceptionType(path -> Component.translatable("commands.data.get.invalid", path));
++    static final Dynamic2CommandExceptionType ERROR_GET_MULTIPLE = new Dynamic2CommandExceptionType((path, count) -> Component.translatable("commands.data.get.multiple", path, count));
++    static final DynamicCommandExceptionType ERROR_MULTIPLE_TAGS = new DynamicCommandExceptionType(name -> Component.translatable("commands.data.modify.multiple_tags", name));
++    static final Dynamic2CommandExceptionType ERROR_EXPECTED_OBJECT = new Dynamic2CommandExceptionType((name, type) -> Component.translatable("commands.data.modify.expected_object", name, type));
++    static final Dynamic2CommandExceptionType ERROR_EXPECTED_LIST = new Dynamic2CommandExceptionType((name, type) -> Component.translatable("commands.data.modify.expected_list", name, type));
++    static final Dynamic3CommandExceptionType ERROR_INVALID_INDEX = new Dynamic3CommandExceptionType((name, index, size) -> Component.translatable("commands.data.modify.invalid_index", name, index, size));
++    static final SimpleCommandExceptionType ERROR_MODIFIED_NO_CHANGE = new SimpleCommandExceptionType(Component.translatable("commands.data.modify.failed"));
++    public static final SimpleCommandExceptionType ERROR_INVALID_TARGET_ENTITY = new SimpleCommandExceptionType(Component.translatable("commands.data.entity.invalid"));
++    public static final DynamicCommandExceptionType ERROR_NO_SUCH_BLOCK_ENTITY = new DynamicCommandExceptionType(object -> Component.translatable("commands.data.block.not_found", object));
++    public static final DynamicCommandExceptionType SUCCESS_MODIFIED_SINGLE = new DynamicCommandExceptionType(target -> Component.translatable("commands.data.modify.success", target));
++    public static final Dynamic2CommandExceptionType SUCCESS_MODIFIED_MULTIPLE = new Dynamic2CommandExceptionType((count, target) -> Component.translatable("commands.data.modify.success.count", count, target));
++    public static final SimpleCommandExceptionType ERROR_MERGE_NON_COMPOUND = new SimpleCommandExceptionType(Component.translatable("commands.data.merge.non_compound"));
++
++    public interface DataProvider {
++        CompletableFuture<CompoundTag> getTagAsync(CommandSourceStack source, Plugin plugin) throws CommandSyntaxException;
++        void setTagAsync(CommandSourceStack source, Plugin plugin, CompoundTag tag, Component successMessage) throws CommandSyntaxException;
++        Component getQueryMessage(Tag tag);
++        Component getGetMessage(NbtPathArgument.NbtPath path, double scale, Tag value);
++        String getTargetName();
++    }
++
++    @FunctionalInterface
++    interface DataModifier {
++        int apply(CompoundTag targetNbtRoot, NbtPathArgument.NbtPath targetPath, List<Tag> sourceTags) throws CommandSyntaxException;
++    }
++
++    abstract static class DataManipulatorArgument {
++        public final String commandName;
++        public final Function<LiteralArgumentBuilder<CommandSourceStack>, ArgumentBuilder<CommandSourceStack, ?>> argumentApplier;
++
++        public DataManipulatorArgument(String name) {
++            this.commandName = name;
++            if ("entity".equals(name)) {
++                this.argumentApplier = literal -> literal.then(Commands.argument("target", EntityArgument.entity()));
++            } else if ("block".equals(name)) {
++                this.argumentApplier = literal -> literal.then(Commands.argument("target", BlockPosArgument.blockPos()));
++            } else {
++                throw new IllegalArgumentException("Unsupported provider type: " + name);
++            }
++        }
++        abstract DataProvider getProvider(CommandContext<CommandSourceStack> context) throws CommandSyntaxException;
++    }
++
++    private static final List<DataManipulatorArgument> TARGET_PROVIDERS = ImmutableList.of(
++        new DataManipulatorArgument("entity") {
++            @Override DataProvider getProvider(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
++                Entity entity = EntityArgument.getEntity(context, "target");
++                 if (entity instanceof net.minecraft.server.level.ServerPlayer && entity.isRemoved()) {
++                    throw ERROR_INVALID_TARGET_ENTITY.create();
++                }
++                return new EntityDataAccessor(entity);
++            }
++        },
++        new DataManipulatorArgument("block") {
++            @Override DataProvider getProvider(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
++                BlockPos pos = BlockPosArgument.getLoadedBlockPos(context, "target");
++                BlockEntity be = context.getSource().getLevel().getBlockEntity(pos);
++                if (be == null) throw ERROR_NO_SUCH_BLOCK_ENTITY.create(pos.getX() + ", " + pos.getY() + ", " + pos.getZ());
++                return new BlockDataAccessor(be, pos);
++            }
++        }
++    );
++
++    private static final List<DataManipulatorArgument> SOURCE_PROVIDERS = TARGET_PROVIDERS;
++
++    private static Plugin getMinecraftPlugin(CommandSourceStack source) {
++        return source.getServer().getMinecraftPlugin();
++    }
++
++    private static void scheduleFeedback(CommandSourceStack source, Plugin plugin, Supplier<Component> messageSupplier, boolean success, int resultValue) {
++        Runnable feedbackTask = () -> {
++            if (success) {
++                source.sendSuccess(messageSupplier, true);
++            } else {
++                source.sendFailure(messageSupplier.get());
++            }
++        };
++        if (source.getEntity() != null && source.getEntity().getBukkitEntity().getScheduler() != null) {
++            source.getEntity().getBukkitEntity().getScheduler().execute(plugin, feedbackTask, null, 0L);
++        } else {
++            source.getServer().getGlobalRegionScheduler().execute(plugin, feedbackTask);
++        }
++    }
++
++    private static void scheduleFeedback(CommandSourceStack source, Plugin plugin, Supplier<Component> messageSupplier, boolean success) {
++        scheduleFeedback(source, plugin, messageSupplier, success, 1);
++    }
++
++     private static void scheduleFeedbackMessage(CommandSourceStack source, Plugin plugin, Component message, boolean success) {
++         Runnable feedbackTask = () -> {
++            if (success) {
++                source.sendSuccess(() -> message, true);
++            } else {
++                source.sendFailure(message);
++            }
++        };
++        if (source.getEntity() != null && source.getEntity().getBukkitEntity().getScheduler() != null) {
++            source.getEntity().getBukkitEntity().getScheduler().execute(plugin, feedbackTask, null, 0L);
++        } else {
++            source.getServer().getGlobalRegionScheduler().execute(plugin, feedbackTask);
++        }
++    }
++
++    public static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
++        LiteralArgumentBuilder<CommandSourceStack> rootCommand = Commands.literal("data").requires((source) -> source.hasPermission(2));
++
++        for (DataManipulatorArgument providerArgDefinition : TARGET_PROVIDERS) {
++            LiteralArgumentBuilder<CommandSourceStack> providerBranchRoot = Commands.literal(providerArgDefinition.commandName);
++            ArgumentBuilder<CommandSourceStack, ?> appliedProviderArgument = providerArgDefinition.argumentApplier.apply(providerBranchRoot);
++
++            appliedProviderArgument.then(Commands.literal("get")
++                .executes(ctx -> getData(ctx.getSource(), providerArgDefinition.getProvider(ctx), null, 1.0D))
++                .then(Commands.argument("path", NbtPathArgument.nbtPath())
++                    .executes(ctx -> getData(ctx.getSource(), providerArgDefinition.getProvider(ctx), NbtPathArgument.getPath(ctx, "path"), 1.0D))
++                    .then(Commands.argument("scale", DoubleArgumentType.doubleArg())
++                        .executes(ctx -> getData(ctx.getSource(), providerArgDefinition.getProvider(ctx), NbtPathArgument.getPath(ctx, "path"), DoubleArgumentType.getDouble(ctx, "scale")))
++                    )
++                )
++            );
++
++            appliedProviderArgument.then(Commands.literal("merge")
++                .then(Commands.argument("nbt", CompoundTagArgument.compoundTag())
++                    .executes(ctx -> mergeData(ctx.getSource(), providerArgDefinition.getProvider(ctx), CompoundTagArgument.getCompoundTag(ctx, "nbt")))
++                )
++            );
++
++            appliedProviderArgument.then(Commands.literal("remove")
++                .then(Commands.argument("path", NbtPathArgument.nbtPath())
++                    .executes(ctx -> removeData(ctx.getSource(), providerArgDefinition.getProvider(ctx), NbtPathArgument.getPath(ctx, "path")))
++                )
++            );
++
++            LiteralArgumentBuilder<CommandSourceStack> modifySubcommandRoot = Commands.literal("modify");
++            modifySubcommandRoot.then(Commands.argument("targetPath", NbtPathArgument.nbtPath())
++                .then(buildModifyOperation("set", providerArgDefinition,
++                    (targetNbtRoot, path, sourceTags) -> path.set(targetNbtRoot, () -> sourceTags.get(0).copy()) // NbtPath::set takes Supplier
++                ))
++                .then(buildModifyOperation("append", providerArgDefinition,
++                    (targetNbtRoot, path, sourceTags) -> path.insert(-1, targetNbtRoot, sourceTags.stream().map(Tag::copy).collect(Collectors.toList()))
++                ))
++                .then(buildModifyOperation("prepend", providerArgDefinition,
++                    (targetNbtRoot, path, sourceTags) -> path.insert(0, targetNbtRoot, sourceTags.stream().map(Tag::copy).collect(Collectors.toList()))
++                ))
++                .then(buildModifyOperation("merge", providerArgDefinition,
++                    (targetNbtRoot, path, sourceTags) -> {
++                        if (sourceTags.size() != 1 || !(sourceTags.get(0) instanceof CompoundTag)) {
++                            throw ERROR_MERGE_NON_COMPOUND.create(); // Or a more specific error for modify merge
++                        }
++                        return path.merge(targetNbtRoot, (CompoundTag)sourceTags.get(0).copy());
++                    }
++                ))
++                // INSERT operation needs special handling for the index argument
++                .then(buildInsertOperation(providerArgDefinition))
++            );
++            appliedProviderArgument.then(modifySubcommandRoot);
++
++            rootCommand.then(appliedProviderArgument);
++        }
++        dispatcher.register(rootCommand);
++    }
++
++    // Builds the "insert <index>" command structure
++    private static LiteralArgumentBuilder<CommandSourceStack> buildInsertOperation(DataManipulatorArgument targetProviderDefinition) {
++        LiteralArgumentBuilder<CommandSourceStack> insertLiteral = Commands.literal("insert");
++        ArgumentBuilder<CommandSourceStack, ?> indexArgumentNode = Commands.argument("index", IntegerArgumentType.integer());
++
++        // VALUE source for "insert <index> value <sourceTag>"
++        indexArgumentNode.then(Commands.literal("value")
++            .then(Commands.argument("sourceTag", NbtTagArgument.nbtTag())
++                .executes(ctx -> {
++                    List<Tag> sourceTags = Collections.singletonList(NbtTagArgument.getTag(ctx, "sourceTag").copy());
++                    int indexVal = IntegerArgumentType.getInteger(ctx, "index");
++                    DataModifier modifier = (targetNbt, path, tags) -> path.insert(indexVal, targetNbt, tags);
++                    return modifyData(ctx.getSource(),
++                                      targetProviderDefinition.getProvider(ctx),
++                                      NbtPathArgument.getPath(ctx, "targetPath"),
++                                      modifier,
++                                      sourceTags,
++                                      null);
++                })
++            )
++        );
++
++        // FROM source for "insert <index> from <sourceProvider> <sourcePath>"
++        for (DataManipulatorArgument sourceProviderDef : SOURCE_PROVIDERS) {
++            LiteralArgumentBuilder<CommandSourceStack> fromNode = Commands.literal(sourceProviderDef.commandName);
++            ArgumentBuilder<CommandSourceStack, ?> fromProviderArg = sourceProviderDef.argumentApplier.apply(fromNode);
++            fromProviderArg.then(Commands.argument("sourcePath", NbtPathArgument.nbtPath())
++                .executes(ctx -> {
++                    int indexVal = IntegerArgumentType.getInteger(ctx, "index");
++                    DataModifier modifier = (targetNbt, path, tags) -> path.insert(indexVal, targetNbt, tags);
++
++                    DataProvider fromProvider = sourceProviderDef.getProvider(ctx);
++                    NbtPathArgument.NbtPath fromPath = NbtPathArgument.getPath(ctx, "sourcePath");
++                    CompletableFuture<List<Tag>> sourceNbtFuture = fromProvider.getTagAsync(ctx.getSource(), getMinecraftPlugin(ctx.getSource()))
++                        .thenApplyAsync(sourceNbtRoot -> {
++                            try {
++                                List<Tag> tags = fromPath.get(sourceNbtRoot);
++                                if (tags.isEmpty()) throw ERROR_GET_NOT_FOUND.create(fromPath.toString());
++                                return tags.stream().map(Tag::copy).collect(Collectors.toList());
++                            } catch (CommandSyntaxException e) { throw new CompletionException(e); }
++                        }, ctx.getSource().getServer().getSameThreadExecutor(getMinecraftPlugin(ctx.getSource())));
++
++                    return modifyData(ctx.getSource(),
++                                      targetProviderDefinition.getProvider(ctx),
++                                      NbtPathArgument.getPath(ctx, "targetPath"),
++                                      modifier,
++                                      null,
++                                      sourceNbtFuture);
++                })
++            );
++            indexArgumentNode.then(fromNode); // Attach "from <provider>" to "index" argument
++        }
++        insertLiteral.then(indexArgumentNode); // Attach "index" argument and its children ("value", "from ...") to "insert"
++        return insertLiteral;
++    }
++
++    // Build general modify operations (set, append, prepend, merge as modify op)
++    private static ArgumentBuilder<CommandSourceStack, ?> buildModifyOperation(String operationName,
++                                                                          DataManipulatorArgument targetProviderDefinition,
++                                                                          DataModifier modifier) {
++        LiteralArgumentBuilder<CommandSourceStack> operationBuilder = Commands.literal(operationName);
++
++        operationBuilder.then(Commands.literal("value")
++            .then(Commands.argument("sourceTag", NbtTagArgument.nbtTag())
++                .executes(ctx -> {
++                    List<Tag> sourceTags = Collections.singletonList(NbtTagArgument.getTag(ctx, "sourceTag").copy());
++                    return modifyData(ctx.getSource(),
++                                      targetProviderDefinition.getProvider(ctx),
++                                      NbtPathArgument.getPath(ctx, "targetPath"),
++                                      modifier,
++                                      sourceTags,
++                                      null);
++                })
++            )
++        );
++
++        for (DataManipulatorArgument sourceProviderDef : SOURCE_PROVIDERS) {
++            LiteralArgumentBuilder<CommandSourceStack> sourceProviderBranch = Commands.literal(sourceProviderDef.commandName);
++            ArgumentBuilder<CommandSourceStack, ?> appliedSourceProviderArg = sourceProviderDef.argumentApplier.apply(sourceProviderBranch);
++
++            appliedSourceProviderArg.then(Commands.argument("sourcePath", NbtPathArgument.nbtPath())
++                .executes(ctx -> {
++                    DataProvider fromProvider = sourceProviderDef.getProvider(ctx);
++                    NbtPathArgument.NbtPath fromPath = NbtPathArgument.getPath(ctx, "sourcePath");
++
++                    CompletableFuture<List<Tag>> sourceNbtFuture = fromProvider.getTagAsync(ctx.getSource(), getMinecraftPlugin(ctx.getSource()))
++                        .thenApplyAsync(sourceNbtRoot -> {
++                            try {
++                                List<Tag> tags = fromPath.get(sourceNbtRoot);
++                                if (tags.isEmpty()) throw ERROR_GET_NOT_FOUND.create(fromPath.toString());
++                                return tags.stream().map(Tag::copy).collect(Collectors.toList());
++                            } catch (CommandSyntaxException e) { throw new CompletionException(e); }
++                        }, ctx.getSource().getServer().getSameThreadExecutor(getMinecraftPlugin(ctx.getSource())));
++
++                    return modifyData(ctx.getSource(),
++                                      targetProviderDefinition.getProvider(ctx),
++                                      NbtPathArgument.getPath(ctx, "targetPath"),
++                                      modifier,
++                                      null,
++                                      sourceNbtFuture);
++                })
++            );
++            operationBuilder.then(appliedSourceProviderArg);
++        }
++        return operationBuilder;
++    }
++
++    private static int modifyData(CommandSourceStack source,
++                              DataProvider targetProvider,
++                              NbtPathArgument.NbtPath targetPath,
++                              DataModifier modifier,
++                              List<Tag> directSourceTags,
++                              CompletableFuture<List<Tag>> sourceNbtFuture
++                             ) throws CommandSyntaxException {
++        Plugin plugin = getMinecraftPlugin(source);
++
++        CompletableFuture<List<Tag>> effectiveSourceTagsFuture;
++        if (directSourceTags != null) {
++            effectiveSourceTagsFuture = CompletableFuture.completedFuture(directSourceTags);
++        } else if (sourceNbtFuture != null) {
++            effectiveSourceTagsFuture = sourceNbtFuture;
++        } else {
++            throw new CommandSyntaxException(new SimpleCommandExceptionType(Component.literal("Invalid modify operation: No source NBT provided.")), Component.literal("No source NBT."));
++        }
++
++        effectiveSourceTagsFuture.thenComposeAsync(sourceTags -> {
++            if (sourceTags == null || sourceTags.isEmpty()) {
++                throw new CompletionException(ERROR_MODIFIED_NO_CHANGE.create());
++            }
++            return targetProvider.getTagAsync(source, plugin)
++                .thenApplyAsync(targetNbtRoot -> {
++                    try {
++                        CompoundTag targetNbtCopy = targetNbtRoot.copy();
++                        int changes = modifier.apply(targetNbtCopy, targetPath, sourceTags);
++                        if (changes == 0) {
++                            throw ERROR_MODIFIED_NO_CHANGE.create();
++                        }
++                        return new Pair<>(changes, targetNbtCopy);
++                    } catch (CommandSyntaxException e) {
++                        throw new CompletionException(e);
++                    }
++                }, source.getServer().getSameThreadExecutor(plugin));
++        }, source.getServer().getSameThreadExecutor(plugin))
++        .thenAcceptAsync(resultPair -> {
++            int changes = resultPair.getFirst();
++            CompoundTag modifiedNbt = resultPair.getSecond();
++            Component successMsg;
++            if (changes == 1) {
++                 successMsg = SUCCESS_MODIFIED_SINGLE.create(targetProvider.getTargetName());
++            } else {
++                 successMsg = SUCCESS_MODIFIED_MULTIPLE.create(changes, targetProvider.getTargetName());
++            }
++            targetProvider.setTagAsync(source, plugin, modifiedNbt, successMsg);
++        }, source.getServer().getSameThreadExecutor(plugin))
++        .exceptionally(ex -> {
++            Throwable cause = ex;
++            while (cause instanceof CompletionException && cause.getCause() != null) {
++                cause = cause.getCause();
++            }
++            if (cause instanceof CommandSyntaxException cse) {
++                scheduleFeedback(source, plugin, cse::getComponent, false);
++            } else {
++                MinecraftServer.LOGGER.error("[DataCommand] Error in modifyData future chain for target " + targetProvider.getTargetName(), cause);
++                scheduleFeedback(source, plugin, () -> Component.literal("Failed to modify data: " + cause.getMessage()), false);
++            }
++            return null;
++        });
++        return 1;
++    }
++
++    private static int getData(CommandSourceStack source, DataProvider provider, NbtPathArgument.NbtPath path, double scale) throws CommandSyntaxException {
++        Plugin plugin = getMinecraftPlugin(source);
++        provider.getTagAsync(source, plugin).thenAcceptAsync(nbt -> {
++            try {
++                Tag resultTag;
++                if (path == null) {
++                    resultTag = nbt;
++                     scheduleFeedback(source, plugin, () -> provider.getQueryMessage(resultTag.copy()), true, nbt.hashCode());
++                } else {
++                    List<Tag> foundTags = path.get(nbt);
++                    if (foundTags.isEmpty()) throw ERROR_GET_NOT_FOUND.create(path.toString());
++                    if (foundTags.size() > 1 && !path.isCollectionElementQuery()) {
++                         throw ERROR_GET_MULTIPLE.create(path.toString(), foundTags.size());
++                    }
++                    resultTag = foundTags.get(0);
++                    int resultValue = 1;
++                    if (resultTag instanceof NumericTag numericTag) {
++                        resultValue = Mth.floor(numericTag.getAsDouble() * scale);
++                    }
++                    final Tag finalTagToDisplay = resultTag.copy();
++                    scheduleFeedback(source, plugin, () -> provider.getGetMessage(path, scale, finalTagToDisplay), true, resultValue);
++                }
++            } catch (CommandSyntaxException e) {
++                 scheduleFeedback(source, plugin, e::getComponent, false);
++            } catch (Exception e) {
++                MinecraftServer.LOGGER.error("[DataCommand] Error processing get for provider " + provider.getTargetName(), e);
++                scheduleFeedback(source, plugin, () -> Component.literal("Failed to get data: " + e.getMessage()), false);
++            }
++        }, source.getServer().getSameThreadExecutor(plugin))
++        .exceptionally(ex -> {
++            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
++            if (cause instanceof CommandSyntaxException cse) {
++                scheduleFeedback(source, plugin, cse::getComponent, false);
++            } else {
++                MinecraftServer.LOGGER.error("[DataCommand] Exception in getTagAsync future for provider " + provider.getTargetName(), cause);
++                scheduleFeedback(source, plugin, () -> Component.literal("Error getting data: " + cause.getMessage()), false);
++            }
++            return null;
++        });
++        return 1;
++    }
++
++    private static int mergeData(CommandSourceStack source, DataProvider provider, CompoundTag tagToMerge) throws CommandSyntaxException {
++        Plugin plugin = getMinecraftPlugin(source);
++        provider.getTagAsync(source, plugin).thenAcceptAsync(currentNbt -> {
++            try {
++                CompoundTag nbtCopy = currentNbt.copy();
++                CompoundTag originalCopyForCompare = currentNbt.copy();
++                nbtCopy.merge(tagToMerge);
++                if (nbtCopy.equals(originalCopyForCompare)) {
++                    throw ERROR_MERGE_UNCHANGED.create();
++                }
++                provider.setTagAsync(source, plugin, nbtCopy, Component.translatable("commands.data.merge.success", provider.getTargetName()));
++            } catch (CommandSyntaxException e) {
++                scheduleFeedback(source, plugin, e::getComponent, false);
++            } catch (Exception e) {
++                 MinecraftServer.LOGGER.error("[DataCommand] Error processing merge for provider " + provider.getTargetName(), e);
++                scheduleFeedback(source, plugin, () -> Component.literal("Failed to merge data: " + e.getMessage()), false);
++            }
++        }, source.getServer().getSameThreadExecutor(plugin))
++        .exceptionally(ex -> {
++            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
++            if (cause instanceof CommandSyntaxException cse) {
++                scheduleFeedback(source, plugin, cse::getComponent, false);
++            } else {
++                 MinecraftServer.LOGGER.error("[DataCommand] Exception in getTagAsync future for merge from provider " + provider.getTargetName(), cause);
++                scheduleFeedback(source, plugin, () -> Component.literal("Error merging data: " + cause.getMessage()), false);
++            }
++            return null;
++        });
++        return 1;
++    }
++
++    private static int removeData(CommandSourceStack source, DataProvider provider, NbtPathArgument.NbtPath pathToRemove) throws CommandSyntaxException {
++        Plugin plugin = getMinecraftPlugin(source);
++        provider.getTagAsync(source, plugin).thenAcceptAsync(currentNbt -> {
++            try {
++                CompoundTag nbtCopy = currentNbt.copy();
++                int removedCount = pathToRemove.remove(nbtCopy);
++                if (removedCount == 0) {
++                    throw ERROR_MODIFIED_NO_CHANGE.create();
++                }
++                provider.setTagAsync(source, plugin, nbtCopy, Component.translatable("commands.data.remove.success", pathToRemove.toString(), provider.getTargetName()));
++            } catch (CommandSyntaxException e) {
++                scheduleFeedback(source, plugin, e::getComponent, false);
++            } catch (Exception e) {
++                MinecraftServer.LOGGER.error("[DataCommand] Error processing remove for provider " + provider.getTargetName(), e);
++                scheduleFeedback(source, plugin, () -> Component.literal("Failed to remove data: " + e.getMessage()), false);
++            }
++        }, source.getServer().getSameThreadExecutor(plugin))
++        .exceptionally(ex -> {
++            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
++            if (cause instanceof CommandSyntaxException cse) {
++                scheduleFeedback(source, plugin, cse::getComponent, false);
++            } else {
++                MinecraftServer.LOGGER.error("[DataCommand] Exception in getTagAsync future for remove from provider " + provider.getTargetName(), cause);
++                scheduleFeedback(source, plugin, () -> Component.literal("Error removing data: " + cause.getMessage()), false);
++            }
++            return null;
++        });
++        return 1;
++    }
++
++    static class EntityDataAccessor implements DataProvider {
++        private final Entity entity;
++        public EntityDataAccessor(Entity entity) { this.entity = entity; }
++
++        @Override
++        public CompletableFuture<CompoundTag> getTagAsync(CommandSourceStack source, Plugin plugin) {
++            CompletableFuture<CompoundTag> future = new CompletableFuture<>();
++            entity.getBukkitEntity().getScheduler().execute(plugin, () -> {
++                try {
++                    future.complete(entity.saveWithoutId(new CompoundTag()).copy());
++                } catch (Exception e) { future.completeExceptionally(e); }
++            }, null, 0L);
++            return future;
++        }
++
++        @Override
++        public void setTagAsync(CommandSourceStack source, Plugin plugin, CompoundTag tag, Component successMessage) {
++            entity.getBukkitEntity().getScheduler().execute(plugin, () -> {
++                try {
++                    UUID uuid = entity.getUUID();
++                    entity.load(tag);
++                    entity.setUUID(uuid);
++                    scheduleFeedbackMessage(source, plugin, successMessage, true);
++                } catch (Exception e) {
++                    MinecraftServer.LOGGER.error("[DataCommand] Error setting entity data for " + entity.getName().getString(), e);
++                    scheduleFeedback(source, plugin, () -> Component.literal("Failed to set entity data: " + e.getMessage()), false);
++                }
++            }, null, 0L);
++        }
++
++        @Override public Component getQueryMessage(Tag tag) { return Component.translatable("commands.data.entity.query", entity.getDisplayName(), tag.getPrettyDisplay("    ",0)); }
++        @Override public Component getGetMessage(NbtPathArgument.NbtPath path, double scale, Tag value) { return Component.translatable("commands.data.entity.get", path.toString(), entity.getDisplayName(), String.format("%.2f", scale), value.getPrettyDisplay("    ",0)); }
++        @Override public String getTargetName() { return entity.getDisplayName().getString(); }
++    }
++
++    static class BlockDataAccessor implements DataProvider {
++        private final BlockEntity blockEntity;
++        private final BlockPos pos;
++        public BlockDataAccessor(BlockEntity blockEntity, BlockPos pos) { this.blockEntity = blockEntity; this.pos = pos; }
++
++        @Override
++        public CompletableFuture<CompoundTag> getTagAsync(CommandSourceStack source, Plugin plugin) {
++            CompletableFuture<CompoundTag> future = new CompletableFuture<>();
++            ServerLevel level = source.getLevel();
++            level.getRegionScheduler().execute(plugin, level, pos.getX() >> 4, pos.getZ() >> 4, () -> {
++                try {
++                    BlockEntity currentBe = level.getBlockEntity(pos);
++                    if (currentBe == null) {
++                         future.completeExceptionally(new CommandSyntaxException(ERROR_NO_SUCH_BLOCK_ENTITY, Component.literal("Block entity at " + pos + " removed.")));
++                         return;
++                    }
++                    future.complete(currentBe.saveWithFullMetadata(level.registryAccess()).copy());
++                } catch (Exception e) { future.completeExceptionally(e); }
++            });
++            return future;
++        }
++
++        @Override
++        public void setTagAsync(CommandSourceStack source, Plugin plugin, CompoundTag tag, Component successMessage) {
++            ServerLevel level = source.getLevel();
++            level.getRegionScheduler().execute(plugin, level, pos.getX() >> 4, pos.getZ() >> 4, () -> {
++                try {
++                    BlockEntity currentBe = level.getBlockEntity(pos);
++                     if (currentBe == null) {
++                         scheduleFeedback(source, plugin, () -> Component.literal("Block entity at " + pos + " removed before modification."), false);
++                         return;
++                    }
++                    currentBe.loadCustomOnly(tag, level.registryAccess());
++                    currentBe.setChanged();
++                    BlockState currentState = currentBe.getBlockState();
++                    level.sendBlockUpdated(pos, currentState, currentState, 3);
++                    scheduleFeedbackMessage(source, plugin, successMessage, true);
++                } catch (Exception e) {
++                     MinecraftServer.LOGGER.error("[DataCommand] Error setting block entity data for " + pos, e);
++                    scheduleFeedback(source, plugin, () -> Component.literal("Failed to set block data: " + e.getMessage()), false);
++                }
++            });
++        }
++
++        @Override public Component getQueryMessage(Tag tag) { return Component.translatable("commands.data.block.query", pos.getX(), pos.getY(), pos.getZ(), tag.getPrettyDisplay("    ",0)); }
++        @Override public Component getGetMessage(NbtPathArgument.NbtPath path, double scale, Tag value) { return Component.translatable("commands.data.block.get", path.toString(), pos.getX(), pos.getY(), pos.getZ(), String.format("%.2f", scale), value.getPrettyDisplay("    ",0)); }
++        @Override public String getTargetName() { return pos.getX() + " " + pos.getY() + " " + pos.getZ(); }
++    }
++}
