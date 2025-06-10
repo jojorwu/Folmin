@@ -1,31 +1,47 @@
 --- a/net/minecraft/commands/Commands.java
 +++ b/net/minecraft/commands/Commands.java
-@@ -252,7 +252,7 @@
+@@ -250,9 +250,9 @@
+         ScoreboardCommand.register(this.dispatcher);
+         SeedCommand.register(this.dispatcher, this.environment.acl()); // Paper
          AdvancementCommands.register(this.dispatcher);
 -        //TagCommand.register(this.dispatcher); // Folia - region threading - TODO later
-+        TagCommand.register(this.dispatcher); // Folia - region threading - TODO later
++        TagCommand.register(this.dispatcher); // Folia - region threading - REIMPLEMENTED
          ExecuteCommand.register(this.dispatcher, this.context);
+-        BossBarCommands.register(this.dispatcher);
++        BossBarCommands.register(this.dispatcher); // Paper - moved down
+         ClearInventoryCommands.register(this.dispatcher, this.context);
+         CloneCommands.register(this.dispatcher, this.context);
+         DebugCommands.register(this.dispatcher);
 --- a/net/minecraft/commands/TagCommand.java
 +++ b/net/minecraft/commands/TagCommand.java
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,144 @@
 +package net.minecraft.commands;
 +
 +import com.mojang.brigadier.CommandDispatcher;
 +import com.mojang.brigadier.arguments.StringArgumentType;
++import com.mojang.brigadier.builder.LiteralArgumentBuilder;
++import com.mojang.brigadier.builder.RequiredArgumentBuilder;
 +import com.mojang.brigadier.exceptions.CommandSyntaxException;
++import com.mojang.brigadier.exceptions.SimpleCommandExceptionType;
 +import java.util.Collection;
 +import java.util.Set;
 +import java.util.concurrent.atomic.AtomicInteger;
++import java.util.function.Supplier;
 +import net.minecraft.commands.arguments.EntityArgument;
 +import net.minecraft.network.chat.Component;
 +import net.minecraft.network.chat.ComponentUtils;
++import net.minecraft.server.MinecraftServer;
 +import net.minecraft.world.entity.Entity;
 +import org.bukkit.plugin.Plugin;
 +
 +public class TagCommand {
 +
-+    private static Plugin getMinecraftPlugin(CommandSourceStack source) {
-+        // Folia: Use the server's plugin instance for scheduling NMS commands.
++    private static final SimpleCommandExceptionType ERROR_ADD_FAILED = new SimpleCommandExceptionType(Component.translatable("commands.tag.add.failed"));
++    private static final SimpleCommandExceptionType ERROR_REMOVE_FAILED = new SimpleCommandExceptionType(Component.translatable("commands.tag.remove.failed"));
++    private static final Component LIST_EMPTY_COMPONENT = Component.translatable("commands.tag.list.empty");
++
++    private static Plugin getPlugin(CommandSourceStack source) {
++        // Assuming source.getServer().getMinecraftPlugin() is available via Folia patches.
 +        return source.getServer().getMinecraftPlugin();
 +    }
 +
@@ -64,126 +80,111 @@
 +        );
 +    }
 +
-+    private static int addTag(CommandSourceStack source, Collection<? extends Entity> targets, String tagName) throws CommandSyntaxException {
-+        int totalTargets = targets.size();
-+        if (totalTargets == 0) {
-+            source.sendFailure(Component.translatable("argument.entity.notfound.entity")); // Standard NMS message
-+            return 0;
++    private static void scheduleFeedback(CommandSourceStack source, Plugin plugin, Supplier<Component> messageSupplier, boolean success) {
++        if (source.getEntity() != null && source.getEntity().getBukkitEntity().getScheduler() != null) {
++            source.getEntity().getBukkitEntity().getScheduler().execute(plugin, () -> {
++                if (success) source.sendSuccess(messageSupplier, true); else source.sendFailure(messageSupplier.get());
++            }, null, 0L);
++        } else {
++            source.getServer().getGlobalRegionScheduler().execute(plugin, () -> {
++                 if (success) source.sendSuccess(messageSupplier, true); else source.sendFailure(messageSupplier.get());
++            });
 +        }
++    }
 +
++    private static int addTag(CommandSourceStack source, Collection<? extends Entity> targets, String tagName) throws CommandSyntaxException {
++        if (targets.isEmpty()) {
++            throw ERROR_ADD_FAILED.create();
++        }
++        int totalTargets = targets.size();
 +        AtomicInteger successCount = new AtomicInteger(0);
 +        AtomicInteger completedCount = new AtomicInteger(0);
-+        Plugin plugin = getMinecraftPlugin(source);
-+        // Capture display name for single target case to ensure it's available in the async callback
-+        final Component singleTargetDisplayName = (totalTargets == 1) ? targets.iterator().next().getDisplayName() : null;
++        final Plugin pluginContext = getPlugin(source);
 +
 +        for (Entity entity : targets) {
-+            entity.getBukkitEntity().getScheduler().execute(plugin, () -> {
-+                // Main task logic: add the tag
-+                if (entity.addTag(tagName)) {
-+                    successCount.incrementAndGet();
-+                }
-+            }, () -> {
-+                // Completion logic: runs after the main task for each entity
-+                if (completedCount.incrementAndGet() == totalTargets) {
-+                    // All tasks have completed, send final summary message
-+                    final int successful = successCount.get();
-+                    Runnable messageSender = () -> {
++            final Entity currentEntity = entity;
++            currentEntity.getBukkitEntity().getScheduler().execute(pluginContext,
++                () -> {
++                    if (currentEntity.addTag(tagName)) {
++                        successCount.incrementAndGet();
++                    }
++                },
++                () -> {
++                    if (completedCount.incrementAndGet() == totalTargets) {
++                        final int successful = successCount.get();
 +                        if (successful == 0) {
-+                            source.sendFailure(Component.translatable("commands.tag.add.failed"));
++                            scheduleFeedback(source, pluginContext, ERROR_ADD_FAILED::getComponent, false);
 +                        } else {
-+                            if (totalTargets == 1 && successful == 1 && singleTargetDisplayName != null) {
-+                                source.sendSuccess(() -> Component.translatable("commands.tag.add.success.single", tagName, singleTargetDisplayName), true);
++                            if (totalTargets == 1) {
++                                scheduleFeedback(source, pluginContext, () -> Component.translatable("commands.tag.add.success.single", tagName, targets.iterator().next().getDisplayName()), true);
 +                            } else {
-+                                source.sendSuccess(() -> Component.translatable("commands.tag.add.success.multiple", tagName, successful), true);
++                                scheduleFeedback(source, pluginContext, () -> Component.translatable("commands.tag.add.success.multiple", tagName, successful), true);
 +                            }
 +                        }
-+                    };
-+                    // Schedule the feedback message on the appropriate scheduler
-+                    if (source.getEntity() != null && source.getEntity().getBukkitEntity().getScheduler() != null) {
-+                        source.getEntity().getBukkitEntity().getScheduler().execute(plugin, messageSender, null, 0L);
-+                    } else { // Console or other non-entity source
-+                        source.getServer().getGlobalRegionScheduler().execute(plugin, messageSender);
 +                    }
-+                }
-+            }, 0L); // Execute immediately on the entity's region thread
++                }, 0L);
 +        }
-+        return targets.size(); // Initial return, async feedback will follow
++        return targets.size();
 +    }
 +
 +    private static int removeTag(CommandSourceStack source, Collection<? extends Entity> targets, String tagName) throws CommandSyntaxException {
-+        int totalTargets = targets.size();
-+        if (totalTargets == 0) {
-+            source.sendFailure(Component.translatable("argument.entity.notfound.entity"));
-+            return 0;
++        if (targets.isEmpty()) {
++            throw ERROR_REMOVE_FAILED.create();
 +        }
-+
++        int totalTargets = targets.size();
 +        AtomicInteger successCount = new AtomicInteger(0);
 +        AtomicInteger completedCount = new AtomicInteger(0);
-+        Plugin plugin = getMinecraftPlugin(source);
-+        final Component singleTargetDisplayNameRemove = (totalTargets == 1) ? targets.iterator().next().getDisplayName() : null;
++        final Plugin pluginContext = getPlugin(source);
 +
 +        for (Entity entity : targets) {
-+            entity.getBukkitEntity().getScheduler().execute(plugin, () -> {
-+                if (entity.removeTag(tagName)) {
-+                    successCount.incrementAndGet();
-+                }
-+            }, () -> {
-+                if (completedCount.incrementAndGet() == totalTargets) {
-+                    final int successful = successCount.get();
-+                    Runnable messageSender = () -> {
++            final Entity currentEntity = entity;
++            currentEntity.getBukkitEntity().getScheduler().execute(pluginContext,
++                () -> {
++                    if (currentEntity.removeTag(tagName)) {
++                        successCount.incrementAndGet();
++                    }
++                },
++                () -> {
++                    if (completedCount.incrementAndGet() == totalTargets) {
++                        final int successful = successCount.get();
 +                        if (successful == 0) {
-+                            source.sendFailure(Component.translatable("commands.tag.remove.failed"));
++                             scheduleFeedback(source, pluginContext, ERROR_REMOVE_FAILED::getComponent, false);
 +                        } else {
-+                            if (totalTargets == 1 && successful == 1 && singleTargetDisplayNameRemove != null) {
-+                                source.sendSuccess(() -> Component.translatable("commands.tag.remove.success.single", tagName, singleTargetDisplayNameRemove), true);
++                            if (totalTargets == 1) {
++                                scheduleFeedback(source, pluginContext, () -> Component.translatable("commands.tag.remove.success.single", tagName, targets.iterator().next().getDisplayName()), true);
 +                            } else {
-+                                source.sendSuccess(() -> Component.translatable("commands.tag.remove.success.multiple", tagName, successful), true);
++                                scheduleFeedback(source, pluginContext, () -> Component.translatable("commands.tag.remove.success.multiple", tagName, successful), true);
 +                            }
 +                        }
-+                    };
-+                    if (source.getEntity() != null && source.getEntity().getBukkitEntity().getScheduler() != null) {
-+                        source.getEntity().getBukkitEntity().getScheduler().execute(plugin, messageSender, null, 0L);
-+                    } else {
-+                        source.getServer().getGlobalRegionScheduler().execute(plugin, messageSender);
 +                    }
-+                }
-+            }, 0L);
++                }, 0L);
 +        }
 +        return targets.size();
 +    }
 +
 +    private static int listTags(CommandSourceStack source, Collection<? extends Entity> targets) {
-+        Plugin plugin = getMinecraftPlugin(source);
-+
 +        if (targets.isEmpty()) {
-+            // Consistent with add/remove, though list usually doesn't fail on no targets, just shows nothing.
-+            // Depending on NMS vanilla behavior, this might just return 0 without error.
-+            // For now, keeping it consistent with add/remove's "no entity found" handling.
-+            source.sendFailure(Component.translatable("argument.entity.notfound.entity"));
++            source.sendFailure(LIST_EMPTY_COMPONENT);
 +            return 0;
 +        }
++        final Plugin pluginContext = getPlugin(source);
 +
 +        for (Entity entity : targets) {
-+            final Component entityDisplayName = entity.getDisplayName(); // Capture for use in lambda
-+            entity.getBukkitEntity().getScheduler().execute(plugin, () -> {
-+                Set<String> tags = entity.getTags();
-+                final Component message;
-+                if (tags.isEmpty()) {
-+                    message = Component.translatable("commands.tag.list.empty.single", entityDisplayName);
-+                } else {
-+                    message = Component.translatable("commands.tag.list.success.single", entityDisplayName, tags.size(), ComponentUtils.formatList(tags));
-+                }
++            final Entity currentEntity = entity;
++            final Component entityDisplayName = currentEntity.getDisplayName();
 +
-+                Runnable messageSender = () -> source.sendSuccess(() -> message, false); // false = don't broadcast to ops
-+
-+                if (source.getEntity() != null && source.getEntity().getBukkitEntity().getScheduler() != null) {
-+                    source.getEntity().getBukkitEntity().getScheduler().execute(plugin, messageSender, null, 0L);
-+                } else { // Console or other non-entity source
-+                    source.getServer().getGlobalRegionScheduler().execute(plugin, messageSender);
-+                }
-+            }, null, 0L); // No separate completion runnable for list, message sent in main task logic
++            currentEntity.getBukkitEntity().getScheduler().execute(pluginContext,
++                () -> {
++                    Set<String> tags = currentEntity.getTags();
++                    final Component message;
++                    if (tags.isEmpty()) {
++                        message = Component.translatable("commands.tag.list.empty.single", entityDisplayName);
++                    } else {
++                        message = Component.translatable("commands.tag.list.success.single", entityDisplayName, tags.size(), ComponentUtils.formatList(tags));
++                    }
++                    scheduleFeedback(source, pluginContext, () -> message, true);
++                }, null, 0L);
 +        }
-+        return targets.size(); // Returns number of entities for which listing was initiated
++        return targets.size();
 +    }
 +}
