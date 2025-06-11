@@ -1,7 +1,5 @@
 <div align=center>
-    <img src="./folia.png">
-    <br /><br />
-    <p>Fork of <a href="https://github.com/PaperMC/Paper">Paper</a> which adds regionised multithreading to the dedicated server.</p>
+    <p>Fork of <a href="https://github.com/PaperMC/Folia">Folia</a> (which itself is a fork of <a href="https://github.com/PaperMC/Paper">Paper</a>) that enhances regionised multithreading for the dedicated server.</p>
 </div>
 
 ## Overview
